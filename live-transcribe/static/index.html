@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>live transcribe</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    background: #fafafa;
+    color: #1a1a1a;
+    font: 400 15px/1.6 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 48px;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+
+  #stage {
+    width: 200px;
+    height: 200px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  #blob {
+    width: 132px;
+    height: 132px;
+    border-radius: 50%;
+    background: #2f6bff;
+    will-change: transform;
+  }
+
+  #text {
+    max-width: 640px;
+    width: calc(100% - 40px);
+    min-height: 3em;
+    text-align: center;
+    font-size: 19px;
+    color: #333;
+  }
+  #text.empty { color: #aaa; }
+  #text .caret {
+    display: inline-block;
+    width: 2px;
+    height: 1em;
+    margin-left: 1px;
+    vertical-align: -0.15em;
+    background: #2f6bff;
+    animation: blink 1.1s steps(1) infinite;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+
+  #start {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #fafafa;
+    cursor: pointer;
+    font-size: 13px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: #888;
+  }
+  #start.hidden { display: none; }
+  #hint {
+    position: fixed;
+    bottom: 20px;
+    font-size: 11px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: #bbb;
+  }
+</style>
+</head>
+<body>
+  <div id="stage"><div id="blob"></div></div>
+  <div id="text" class="empty">waiting for speech<span class="caret"></span></div>
+  <div id="hint"></div>
+  <div id="start">click to start</div>
+
+<script>
+const blob   = document.getElementById("blob");
+const textEl = document.getElementById("text");
+const caret  = textEl.querySelector(".caret");
+const startEl = document.getElementById("start");
+const hintEl  = document.getElementById("hint");
+
+const WORKLET = `
+class PCM extends AudioWorkletProcessor {
+  constructor(o) {
+    super();
+    this.ratio = o.processorOptions.inRate / 24000;
+    this.frac = 0;
+    this.tail = new Float32Array(0);
+    this.pending = [];
+    this.FRAME = 1920;
+  }
+  process(inputs) {
+    const ch = inputs[0][0];
+    if (!ch) return true;
+    const buf = new Float32Array(this.tail.length + ch.length);
+    buf.set(this.tail, 0);
+    buf.set(ch, this.tail.length);
+    let idx = this.frac;
+    for (; idx + 1 < buf.length; idx += this.ratio) {
+      const i0 = idx | 0, f = idx - i0;
+      this.pending.push(buf[i0] * (1 - f) + buf[i0 + 1] * f);
+    }
+    const consumed = Math.floor(idx);
+    this.frac = idx - consumed;
+    this.tail = buf.slice(consumed);
+    while (this.pending.length >= this.FRAME) {
+      const frame = this.pending.splice(0, this.FRAME);
+      const pcm = new Int16Array(this.FRAME);
+      for (let i = 0; i < this.FRAME; i++) {
+        let s = Math.max(-1, Math.min(1, frame[i]));
+        pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+      }
+      this.port.postMessage(pcm.buffer, [pcm.buffer]);
+    }
+    return true;
+  }
+}
+registerProcessor("pcm", PCM);
+`;
+
+let smooth = 0;
+
+function animate() {
+  const scale = 1 + smooth * 0.6;
+  blob.style.transform = `scale(${scale.toFixed(4)})`;
+  requestAnimationFrame(animate);
+}
+requestAnimationFrame(animate);
+
+function appendText(piece) {
+  if (textEl.classList.contains("empty")) {
+    textEl.classList.remove("empty");
+    textEl.textContent = "";
+    textEl.append(caret);
+  }
+  caret.remove();
+  textEl.append(document.createTextNode(piece));
+  textEl.append(caret);
+  while (textEl.textContent.length > 500 && textEl.childNodes.length > 2) {
+    textEl.removeChild(textEl.firstChild);
+  }
+}
+
+async function start() {
+  startEl.textContent = "starting…";
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+  } catch (e) {
+    startEl.textContent = "microphone blocked — allow access and reload";
+    return;
+  }
+
+  const ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+  await ctx.audioWorklet.addModule(
+    URL.createObjectURL(new Blob([WORKLET], { type: "application/javascript" }))
+  );
+  const src = ctx.createMediaStreamSource(stream);
+
+  const analyser = ctx.createAnalyser();
+  analyser.fftSize = 1024;
+  analyser.smoothingTimeConstant = 0.4;
+  src.connect(analyser);
+  const td = new Uint8Array(analyser.fftSize);
+  (function meter() {
+    analyser.getByteTimeDomainData(td);
+    let sum = 0;
+    for (let i = 0; i < td.length; i++) {
+      const v = (td[i] - 128) / 128;
+      sum += v * v;
+    }
+    const rms = Math.sqrt(sum / td.length);
+    const level = Math.min(1, rms * 4.2);
+    smooth += (level - smooth) * 0.25;
+    requestAnimationFrame(meter);
+  })();
+
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const socket = new WebSocket(`${proto}://${location.host}/ws`);
+  socket.binaryType = "arraybuffer";
+
+  const node = new AudioWorkletNode(ctx, "pcm", {
+    processorOptions: { inRate: ctx.sampleRate },
+  });
+  node.port.onmessage = (e) => {
+    if (socket.readyState === WebSocket.OPEN) socket.send(e.data);
+  };
+  src.connect(node);
+  const mute = ctx.createGain();
+  mute.gain.value = 0;
+  node.connect(mute).connect(ctx.destination);
+
+  socket.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    if (msg.type === "text") appendText(msg.text);
+    else if (msg.type === "ready") { startEl.classList.add("hidden"); hintEl.textContent = "listening"; }
+    else if (msg.type === "busy") { startEl.classList.remove("hidden"); startEl.textContent = "another session is active"; }
+  };
+  socket.onclose = () => { hintEl.textContent = "disconnected"; };
+}
+
+startEl.addEventListener("click", start, { once: true });
+</script>
+</body>
+</html>
